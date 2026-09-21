@@ -38,6 +38,12 @@ class DreamMPC_TDMPC2(torch.nn.Module):
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda:0'
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		self._prev_best_actions = torch.zeros(
+				self.cfg.horizon,
+				self.cfg.action_dim,
+				device=self.device,
+			)
+
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -180,11 +186,66 @@ class DreamMPC_TDMPC2(torch.nn.Module):
 						_z = self.model.next(_z, pi_actions[t], task)
 					pi_actions[-1], _ = self.model.pi(_z, task)
 
+
+
 				if self.cfg.action_reusage_coefficient and not t0:
-                    # shift actions by one time step and use the same action as the last for the one beyond the previous prediction horizon
-					corresponding_previously_planned_actions = torch.roll(self._prev_planned_actions, shifts=-1, dims=0)
-					corresponding_previously_planned_actions[-1] = corresponding_previously_planned_actions[-2]
-					pi_actions = self.cfg.action_reusage_coefficient * corresponding_previously_planned_actions +  (1 - self.cfg.action_reusage_coefficient) * pi_actions
+					rho = self.cfg.action_reusage_coefficient
+
+					if self.cfg.action_reuse_strategy == "original":
+						# Original Dream-MPC:
+						# previous candidate n -> current candidate n
+						reused_actions = torch.roll(
+							self._prev_planned_actions,
+							shifts=-1,
+							dims=0,
+						)
+						reused_actions[-1] = reused_actions[-2]
+
+					elif self.cfg.action_reuse_strategy == "mean":
+						# Mean Reuse:
+						# Average all candidate trajectories from
+						# the previous planning step.
+						mean_prev_actions = self._prev_planned_actions.mean(
+							dim=1
+						)
+
+						# Shift trajectory forward by one MPC step.
+						mean_prev_actions = torch.roll(
+							mean_prev_actions,
+							shifts=-1,
+							dims=0,
+						)
+						mean_prev_actions[-1] = mean_prev_actions[-2]
+
+						# [H, action_dim] -> [H, 1, action_dim]
+						# It will be broadcast to all N candidates.
+						reused_actions = mean_prev_actions.unsqueeze(1)
+					elif self.cfg.action_reuse_strategy == "best_j":
+    # Best-J Reuse:
+    # Reuse the complete previous candidate trajectory
+    # with the highest final planner objective J.
+						best_prev_actions = torch.roll(
+							self._prev_best_actions,
+							shifts=-1,
+							dims=0,
+						)
+						best_prev_actions[-1] = best_prev_actions[-2]
+
+						# [H, action_dim] -> [H, 1, action_dim]
+						# Shared by all current candidates.
+						reused_actions = best_prev_actions.unsqueeze(1)
+					
+					else:
+						raise ValueError(
+							f"Unknown action reuse strategy: "
+							f"{self.cfg.action_reuse_strategy}"
+						)
+
+					pi_actions = (
+						rho * reused_actions
+						+ (1 - rho) * pi_actions
+					)
+
 
 				# Initialize state and parameters
 				z = z.repeat(self.cfg.num_pi_trajs, 1)
@@ -214,9 +275,35 @@ class DreamMPC_TDMPC2(torch.nn.Module):
 					if self.cfg.multitask:
 						actions = actions * self.model._action_masks[task]
 
-				idx = returns.detach().argmax(dim=0) 
+				
+				# Preserve the original Dream-MPC action-selection behavior.
+				idx = returns.detach().argmax(dim=0)
 				best_actions = actions[:, idx].detach().clamp(-1, 1)
-				self._prev_planned_actions = actions.detach().clamp(-1, 1)
+
+				# These are the actually valid final candidate trajectories.
+				final_actions = actions.detach().clamp(-1, 1)
+
+				# Used by original / mean reuse.
+				self._prev_planned_actions = final_actions
+
+				# Best-J only needs this extra evaluation when Best-J is enabled.
+				if self.cfg.action_reuse_strategy == "best_j":
+					with torch.no_grad():
+						_, (final_returns, _) = vmap(
+							compute_loss,
+							in_dims=(1, 0, 0),
+							randomness="same",
+						)(
+							final_actions,
+							z,
+							tasks,
+						)
+
+					final_best_idx = final_returns.detach().argmax(dim=0)
+
+					# Store one COMPLETE best trajectory: [H, action_dim]
+					self._prev_best_actions = final_actions[:, final_best_idx]
+
 
 				return best_actions[0]
 
