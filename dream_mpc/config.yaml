@@ -63,6 +63,7 @@ regularization_coefficient: null
 action_reusage_coefficient: null
 # new 加的
 action_reuse_strategy: original
+elite_k: 2
 
 # actor
 log_std_min: -3
