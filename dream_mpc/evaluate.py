@@ -81,6 +81,12 @@ def evaluate(cfg: dict):
 					frames.append(env.render())
 			ep_rewards.append(ep_reward)
 			ep_successes.append(info['success'])
+			print(
+				f'EPISODE task={task} seed={cfg.seed} '
+				f'episode={i + 1} return={float(ep_reward):.6f} '
+				f'success={float(info["success"]):.6f} steps={t}',
+				flush=True,
+			)
 			if cfg.save_video:
 				imageio.mimsave(
 					os.path.join(video_dir, f'{task}-{i}.mp4'), frames, fps=15)

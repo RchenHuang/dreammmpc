@@ -792,7 +792,7 @@ class DreamMPC_TDMPC2(torch.nn.Module):
 					"topk_latent_matching",
 					"topk_objective_matching",
 				):
-					with torch.no_grad():
+					with torch.random.fork_rng(devices=[0]), torch.no_grad():
 						_, (final_returns, _) = vmap(
 							compute_loss,
 							in_dims=(1, 0, 0),
